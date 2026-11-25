@@ -1,0 +1,51 @@
+CREATE TYPE public.app_role AS ENUM ('owner','manager','staff');
+CREATE TABLE public.user_roles (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE, role public.app_role NOT NULL, UNIQUE(user_id,role));
+GRANT SELECT ON public.user_roles TO authenticated; GRANT ALL ON public.user_roles TO service_role;
+ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_role_read ON public.user_roles FOR SELECT TO authenticated USING(auth.uid()=user_id);
+CREATE TABLE public.admin_sessions (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), last_seen_at timestamptz NOT NULL DEFAULT now(), revoked_at timestamptz);
+GRANT ALL ON public.admin_sessions TO service_role;
+ALTER TABLE public.admin_sessions ENABLE ROW LEVEL SECURITY;
+CREATE TABLE public.login_attempts (key text PRIMARY KEY, failures integer NOT NULL DEFAULT 0, locked_until timestamptz, updated_at timestamptz NOT NULL DEFAULT now());
+GRANT ALL ON public.login_attempts TO service_role;
+ALTER TABLE public.login_attempts ENABLE ROW LEVEL SECURITY;
+CREATE OR REPLACE FUNCTION public.reserve_login_attempt(p_key text) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE row_data public.login_attempts;
+BEGIN
+ INSERT INTO public.login_attempts(key) VALUES(p_key) ON CONFLICT DO NOTHING;
+ SELECT * INTO row_data FROM public.login_attempts WHERE key=p_key FOR UPDATE;
+ IF row_data.locked_until>now() THEN RETURN false; END IF;
+ IF row_data.updated_at<now()-interval '15 minutes' THEN row_data.failures:=0; END IF;
+ UPDATE public.login_attempts SET failures=row_data.failures+1, locked_until=CASE WHEN row_data.failures+1>=5 THEN now()+interval '15 minutes' ELSE NULL END, updated_at=now() WHERE key=p_key;
+ RETURN true;
+END $$;
+REVOKE ALL ON FUNCTION public.reserve_login_attempt(text) FROM PUBLIC, anon, authenticated; GRANT EXECUTE ON FUNCTION public.reserve_login_attempt(text) TO service_role;
+CREATE TABLE public.moods(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, name_bn text NOT NULL DEFAULT '', color text NOT NULL, sort_order integer NOT NULL DEFAULT 0);
+GRANT SELECT ON public.moods TO anon,authenticated; GRANT ALL ON public.moods TO service_role;
+ALTER TABLE public.moods ENABLE ROW LEVEL SECURITY;
+CREATE POLICY public_moods ON public.moods FOR SELECT TO anon,authenticated USING(true);
+CREATE TABLE public.products(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, name_bn text NOT NULL DEFAULT '', slug text UNIQUE NOT NULL, tagline text NOT NULL DEFAULT '', description text NOT NULL DEFAULT '', description_bn text NOT NULL DEFAULT '', mood_id uuid REFERENCES public.moods(id), notes jsonb NOT NULL DEFAULT '{"top":[],"heart":[],"base":[]}', sizes jsonb NOT NULL DEFAULT '[]', accent_color text, bottle_image text, gallery_images jsonb NOT NULL DEFAULT '[]', texture_image text, is_published boolean NOT NULL DEFAULT false, is_available boolean NOT NULL DEFAULT true, sort_order integer NOT NULL DEFAULT 0, deleted_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
+GRANT SELECT ON public.products TO anon,authenticated; GRANT ALL ON public.products TO service_role;
+ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+CREATE POLICY public_products ON public.products FOR SELECT TO anon,authenticated USING(is_published AND deleted_at IS NULL);
+CREATE TABLE public.settings(key text PRIMARY KEY, value jsonb NOT NULL, is_public boolean NOT NULL DEFAULT false);
+GRANT SELECT ON public.settings TO anon,authenticated; GRANT ALL ON public.settings TO service_role;
+ALTER TABLE public.settings ENABLE ROW LEVEL SECURITY;
+CREATE POLICY public_settings ON public.settings FOR SELECT TO anon,authenticated USING(is_public);
+CREATE TABLE public.orders(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), order_number bigint GENERATED ALWAYS AS IDENTITY, public_token uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(), customer_name text NOT NULL, phone_encrypted text NOT NULL, address_encrypted text NOT NULL, district text NOT NULL, note text NOT NULL DEFAULT '', items jsonb NOT NULL, delivery_charge numeric NOT NULL, total numeric NOT NULL, payment_method text NOT NULL, transaction_id text, status text NOT NULL DEFAULT 'pending', idempotency_key uuid NOT NULL UNIQUE, created_at timestamptz NOT NULL DEFAULT now());
+GRANT ALL ON public.orders TO service_role;
+ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
+CREATE TABLE public.audit_log(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid, action text NOT NULL, entity text NOT NULL, entity_id text, summary jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now());
+GRANT SELECT,INSERT ON public.audit_log TO service_role;
+ALTER TABLE public.audit_log ENABLE ROW LEVEL SECURITY;
+CREATE OR REPLACE FUNCTION public.audit_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path='' AS $$ BEGIN RAISE EXCEPTION 'Audit entries are immutable'; END $$;
+CREATE TRIGGER audit_immutable BEFORE UPDATE OR DELETE ON public.audit_log FOR EACH ROW EXECUTE FUNCTION public.audit_immutable();
+CREATE OR REPLACE FUNCTION public.provision_designated_owner() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$ BEGIN
+ IF NEW.email='nuruzzamannahid57@gmail.com' AND NEW.email_confirmed_at IS NOT NULL THEN
+ INSERT INTO public.user_roles(user_id,role) VALUES(NEW.id,'owner') ON CONFLICT DO NOTHING;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER provision_designated_owner AFTER INSERT OR UPDATE OF email_confirmed_at ON auth.users FOR EACH ROW EXECUTE FUNCTION public.provision_designated_owner();
+CREATE INDEX products_mood_id_idx ON public.products(mood_id);
+CREATE INDEX admin_sessions_user_id_idx ON public.admin_sessions(user_id);
